@@ -194,6 +194,7 @@ from typing import AsyncGenerator
 
 async def generate_response(backend: str, url: str, model: str, prompt: str, context: List[Dict], api_key: str = "") -> AsyncGenerator[str, None]:
     """Generate response from selected backend asynchronously, supporting streaming."""
+    logger.info(f"generate_response called. Backend: {backend}, Model: {model}, URL: {url}")
     try:
         headers = {"Content-Type": "application/json"}
         if api_key and backend == "Hugging Face": # Assuming HF uses Bearer token
@@ -212,6 +213,8 @@ async def generate_response(backend: str, url: str, model: str, prompt: str, con
             "top_p": st.session_state.top_p,
             "stream": True # Enable streaming
         }
+        logger.info(f"Payload: model={payload.get('model')}, temp={payload.get('temperature')}, stream={payload.get('stream')}, system_prompt_len={len(payload['messages'][0]['content']) if payload['messages'] else 0}, context_len={len(context)}")
+
 
         if backend == "Ollama":
             endpoint = f"{url}/api/chat"
@@ -220,15 +223,23 @@ async def generate_response(backend: str, url: str, model: str, prompt: str, con
         else: # LM Studio and other OpenAI compatibles
             endpoint = f"{url}/chat/completions"
 
+        logger.info(f"Attempting POST to endpoint: {endpoint} for backend: {backend}")
+
         async with aiohttp.ClientSession() as session:
             async with session.post(endpoint, json=payload, headers=headers, ssl=False) as response:
+                logger.info(f"Received response for {endpoint}. Status: {response.status}")
                 if response.status == 200:
+                    logger.info("Starting to read stream...")
+                    lines_processed = 0
                     while True:
                         line_bytes = await response.content.readline()
                         if not line_bytes: # End of stream
+                            logger.debug("Empty line_bytes received, stream ended.")
                             break
 
+                        lines_processed += 1
                         line_str = line_bytes.decode('utf-8').strip()
+                        # logger.debug(f"Processing line ({lines_processed}): {line_str[:100]}") # Log start of line
 
                         if backend == "Ollama":
                             if not line_str: continue
@@ -238,9 +249,10 @@ async def generate_response(backend: str, url: str, model: str, prompt: str, con
                                 if content:
                                     yield content
                                 if chunk_json.get("done"):
+                                    logger.info("Ollama stream 'done' flag received.")
                                     break
                             except json.JSONDecodeError:
-                                logger.warning(f"Ollama Stream: Could not decode JSON from line: {line_str}")
+                                logger.warning(f"Ollama Stream: Could not decode JSON from line: {line_str}", exc_info=True)
                                 continue
                         else: # OpenAI / Hugging Face (SSE format)
                             if line_str.startswith("data: "):
@@ -255,25 +267,41 @@ async def generate_response(backend: str, url: str, model: str, prompt: str, con
                                     if content:
                                         yield content
                                 except json.JSONDecodeError:
-                                    logger.warning(f"SSE Stream: Could not decode JSON from data: {data_part}")
+                                    logger.warning(f"SSE Stream: Could not decode JSON from data: {data_part}", exc_info=True)
                                     continue
-                else:
-                    error_text = await response.text()
-                    error = f"Error: {response.status} - {error_text}"
-                    if "error_log" in st.session_state: st.session_state.error_log.append(error)
-                    logger.error(error)
-                    yield f"Error generating response: Status {response.status}"
+                    logger.info(f"Finished reading stream. Processed {lines_processed} lines.")
+                    if lines_processed == 0:
+                        logger.warning(f"Stream for {model} was empty after a 200 OK response from {endpoint}.")
+                        yield "[Empty response]"
+                else: # Non-200 response
+                    error_text = ""
+                    try:
+                        error_text = await response.text()
+                    except Exception as text_ex:
+                        logger.error(f"Failed to get error response text from {endpoint}: {text_ex}", exc_info=True)
+                    error_message = f"API Error: Status {response.status} - {error_text}"
+                    logger.error(f"Non-200 response from {endpoint}: {error_message}")
+                    if "error_log" in st.session_state: st.session_state.error_log.append(error_message)
+                    yield f"Error from AI provider (Status {response.status}). Check logs."
+                    return # Stop further processing
+
     except aiohttp.ClientError as e:
-        error = f"AIOHTTP ClientError: {str(e)}"
-        if "error_log" in st.session_state: st.session_state.error_log.append(error)
-        logger.error(error)
-        yield f"Network error during response generation: {str(e)}"
+        error_message = f"Network error: {str(e)}"
+        logger.error(f"AIOHTTP ClientError in generate_response for {url}: {error_message}", exc_info=True)
+        if "error_log" in st.session_state: st.session_state.error_log.append(error_message)
+        yield f"Network error: {str(e)}. Please check connection."
+    except json.JSONDecodeError as e: # General JSON decode error if something slips through stream parsing
+        error_message = f"JSON decoding error: {str(e)}"
+        logger.error(f"General JSONDecodeError in generate_response: {error_message}", exc_info=True)
+        if "error_log" in st.session_state: st.session_state.error_log.append(error_message)
+        yield "Sophia received a malformed response."
     except Exception as e:
         error_tb = traceback.format_exc()
-        error = f"Unhandled exception in generate_response: {str(e)}\n{error_tb}"
-        if "error_log" in st.session_state: st.session_state.error_log.append(error)
-        logger.error(error)
-        yield f"Server error during response generation: {str(e)}"
+        error_message = f"Unexpected error: {str(e)}"
+        full_error_details = f"Unhandled exception in generate_response: {str(e)}\nTraceback: {error_tb}"
+        logger.error(full_error_details) # Log the full traceback for server-side debugging
+        if "error_log" in st.session_state: st.session_state.error_log.append(full_error_details)
+        yield "Sophia encountered an unexpected problem. Details have been logged."
 
 def test_ui() -> Dict:
     """Self-test UI elements with detailed diagnostics."""
@@ -345,10 +373,10 @@ def run_prototype():
             <style>
                 .main { display: flex; flex-direction: row; }
                 .chat-column {
-                    height: calc(100vh - 160px); /* May need review depending on other elements */
-                    overflow-y: auto;
-                    padding: 1rem;
-                    padding-bottom: 100px; /* Space for fixed input */
+                    height: calc(100vh - 160px); /* Existing height */
+                    overflow-y: auto !important; /* Ensure scrolling */
+                    padding: 1rem; /* Existing padding */
+                    padding-bottom: 120px !important; /* Increased space for fixed input */
                 }
                 .chat-message { padding: 10px; margin-bottom: 10px; border-radius: 15px; max-width: 80%; }
                 .user-message { background-color: #4a4a4a; color: #FFFFFF; text-align: right; margin-left: auto; } /* Darker user message */
@@ -357,14 +385,14 @@ def run_prototype():
                 .typing-indicator span { height: 10px; width: 10px; background-color: #0078d4; border-radius: 50%; margin-right: 5px; animation: wave 1s infinite ease-in-out; }
                 @keyframes wave { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-5px); } }
                 .chat-input {
-                    position: fixed;
-                    bottom: 0;
-                    left: 0;
-                    right: 0;
-                    background: #222222;
-                    z-index: 1000;
-                    padding: 10px;
-                    border-top: 1px solid #444444;
+                    position: fixed !important;
+                    bottom: 0px !important;
+                    left: 0px !important;
+                    right: 0px !important;
+                    background: #222222; /* Existing from previous */
+                    z-index: 1000 !important;
+                    padding: 10px;  /* Existing from previous */
+                    border-top: 1px solid #444444; /* Existing from previous */
                 }
                 .stTextInput input[type="text"] {
                     color: #FFFFFF !important; /* Light text */
@@ -378,11 +406,11 @@ def run_prototype():
             <style>
                 .main { display: flex; flex-direction: row; }
                 .chat-column {
-                    height: calc(100vh - 160px); /* May need review depending on other elements */
-                    overflow-y: auto;
-                    padding: 1rem;
-                    background: #f0f0f0;
-                    padding-bottom: 100px; /* Space for fixed input */
+                    height: calc(100vh - 160px); /* Existing height */
+                    overflow-y: auto !important; /* Ensure scrolling */
+                    padding: 1rem; /* Existing padding */
+                    background: #f0f0f0; /* Existing background */
+                    padding-bottom: 120px !important; /* Increased space for fixed input */
                 }
                 .chat-message { padding: 10px; margin-bottom: 10px; border-radius: 15px; max-width: 80%; }
                 .user-message { background-color: #d0d0d0; text-align: right; margin-left: auto; }
@@ -391,14 +419,14 @@ def run_prototype():
                 .typing-indicator span { height: 10px; width: 10px; background-color: #00aaff; border-radius: 50%; margin-right: 5px; animation: wave 1s infinite ease-in-out; }
                 @keyframes wave { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-5px); } }
                 .chat-input {
-                    position: fixed;
-                    bottom: 0;
-                    left: 0;
-                    right: 0;
-                    background: #f0f0f0;
-                    z-index: 1000;
-                    padding: 10px;
-                    border-top: 1px solid #cccccc;
+                    position: fixed !important;
+                    bottom: 0px !important;
+                    left: 0px !important;
+                    right: 0px !important;
+                    background: #f0f0f0; /* Existing from previous */
+                    z-index: 1000 !important;
+                    padding: 10px; /* Existing from previous */
+                    border-top: 1px solid #cccccc; /* Existing from previous */
                 }
                 .stTextInput input[type="text"] {
                     color: #000000 !important; /* Dark text */
