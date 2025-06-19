@@ -223,9 +223,10 @@ async def generate_response(backend: str, url: str, model: str, prompt: str, con
         async with aiohttp.ClientSession() as session:
             async with session.post(endpoint, json=payload, headers=headers, ssl=False) as response:
                 if response.status == 200:
-                    async for line_bytes in response.content.readline():
-                        if not line_bytes:
-                            continue
+                    while True:
+                        line_bytes = await response.content.readline()
+                        if not line_bytes: # End of stream
+                            break
 
                         line_str = line_bytes.decode('utf-8').strip()
 
@@ -343,14 +344,28 @@ def run_prototype():
             theme_css = """
             <style>
                 .main { display: flex; flex-direction: row; }
-                .chat-column { height: calc(100vh - 160px); /* Adjusted for potentially taller input area */ overflow-y: auto; padding: 1rem; }
+                .chat-column {
+                    height: calc(100vh - 160px); /* May need review depending on other elements */
+                    overflow-y: auto;
+                    padding: 1rem;
+                    padding-bottom: 100px; /* Space for fixed input */
+                }
                 .chat-message { padding: 10px; margin-bottom: 10px; border-radius: 15px; max-width: 80%; }
                 .user-message { background-color: #4a4a4a; color: #FFFFFF; text-align: right; margin-left: auto; } /* Darker user message */
                 .bot-message { background-color: #0078d4; color: white; text-align: left; }
                 .typing-indicator { display: flex; justify-content: flex-start; }
                 .typing-indicator span { height: 10px; width: 10px; background-color: #0078d4; border-radius: 50%; margin-right: 5px; animation: wave 1s infinite ease-in-out; }
                 @keyframes wave { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-5px); } }
-                .chat-input { position: sticky; bottom: 0; background: #222222; z-index: 10; padding: 10px; border-top: 1px solid #444444; }
+                .chat-input {
+                    position: fixed;
+                    bottom: 0;
+                    left: 0;
+                    right: 0;
+                    background: #222222;
+                    z-index: 1000;
+                    padding: 10px;
+                    border-top: 1px solid #444444;
+                }
                 .stTextInput input[type="text"] {
                     color: #FFFFFF !important; /* Light text */
                     background-color: #333333 !important; /* Dark background for input field */
@@ -362,14 +377,29 @@ def run_prototype():
             theme_css = """
             <style>
                 .main { display: flex; flex-direction: row; }
-                .chat-column { height: calc(100vh - 160px); /* Adjusted for potentially taller input area */ overflow-y: auto; padding: 1rem; background: #f0f0f0; }
+                .chat-column {
+                    height: calc(100vh - 160px); /* May need review depending on other elements */
+                    overflow-y: auto;
+                    padding: 1rem;
+                    background: #f0f0f0;
+                    padding-bottom: 100px; /* Space for fixed input */
+                }
                 .chat-message { padding: 10px; margin-bottom: 10px; border-radius: 15px; max-width: 80%; }
                 .user-message { background-color: #d0d0d0; text-align: right; margin-left: auto; }
                 .bot-message { background-color: #00aaff; color: white; text-align: left; }
                 .typing-indicator { display: flex; justify-content: flex-start; }
                 .typing-indicator span { height: 10px; width: 10px; background-color: #00aaff; border-radius: 50%; margin-right: 5px; animation: wave 1s infinite ease-in-out; }
                 @keyframes wave { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-5px); } }
-                .chat-input { position: sticky; bottom: 0; background: #f0f0f0; z-index: 10; padding: 10px; border-top: 1px solid #cccccc; }
+                .chat-input {
+                    position: fixed;
+                    bottom: 0;
+                    left: 0;
+                    right: 0;
+                    background: #f0f0f0;
+                    z-index: 1000;
+                    padding: 10px;
+                    border-top: 1px solid #cccccc;
+                }
                 .stTextInput input[type="text"] {
                     color: #000000 !important; /* Dark text */
                     background-color: #FFFFFF !important; /* Light background for input field */
@@ -474,7 +504,7 @@ def run_prototype():
                     st.session_state.memory_db = []
                     st.session_state.input_submitted = False
                     st.session_state.last_input = None
-                    st.experimental_rerun() # Ensure UI refreshes
+                    st.rerun() # Ensure UI refreshes
 
         # Main layout
         col1, col2 = st.columns([3, 1])
@@ -543,10 +573,10 @@ def run_prototype():
                         st.session_state.messages.append({"role": "assistant", "content": response_content})
                         if st.session_state.memory_db: st.session_state.memory_db[-1]['output'] = response_content
                         st.session_state.input_submitted = False
-                        st.experimental_rerun()
+                        st.rerun()
                     else:
                         st.session_state.messages.append({"role": "assistant", "content": ""}) # Placeholder for streaming
-                        st.experimental_rerun()
+                        st.rerun()
 
             st.markdown('</div>', unsafe_allow_html=True) # End chat-input
 
@@ -584,7 +614,7 @@ def run_prototype():
                         ):
                             full_response_content += chunk
                             st.session_state.messages[-1]["content"] = full_response_content
-                            st.experimental_rerun()
+                            st.rerun()
 
                     asyncio.run(stream_llm_response())
 
@@ -595,7 +625,7 @@ def run_prototype():
                 st.session_state.input_submitted = False # Reset flag
                 # A final rerun might be needed if the stream was empty or very fast.
                 # However, if every chunk causes a rerun, this might be redundant. Test carefully.
-                st.experimental_rerun()
+                st.rerun()
 
         with col2:
             st.write("Simulation Visuals")
