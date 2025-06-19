@@ -190,11 +190,13 @@ def parse_gl(rune_string: str) -> Dict:
         logger.error(f"GL parsing failed: {str(e)}")
         return {'status': 'ERROR', 'error': str(e)}
 
-async def generate_response(backend: str, url: str, model: str, prompt: str, context: List[Dict], api_key: str = "") -> str:
-    """Generate response from selected backend asynchronously."""
+from typing import AsyncGenerator
+
+async def generate_response(backend: str, url: str, model: str, prompt: str, context: List[Dict], api_key: str = "") -> AsyncGenerator[str, None]:
+    """Generate response from selected backend asynchronously, supporting streaming."""
     try:
         headers = {"Content-Type": "application/json"}
-        if api_key and backend == "Hugging Face":
+        if api_key and backend == "Hugging Face": # Assuming HF uses Bearer token
             headers["Authorization"] = f"Bearer {api_key}"
 
         max_tokens = min(st.session_state.context_length, BACKEND_CONFIG[backend]["max_tokens"])
@@ -208,26 +210,69 @@ async def generate_response(backend: str, url: str, model: str, prompt: str, con
             "max_tokens": max_tokens,
             "temperature": st.session_state.temperature,
             "top_p": st.session_state.top_p,
-            "stream": False
+            "stream": True # Enable streaming
         }
 
-        endpoint = f"{url}/chat/completions" if backend != "Hugging Face" else url
+        if backend == "Ollama":
+            endpoint = f"{url}/api/chat"
+        elif backend == "Hugging Face":
+            endpoint = url # Assuming it's the full completions endpoint for services like Novita
+        else: # LM Studio and other OpenAI compatibles
+            endpoint = f"{url}/chat/completions"
+
         async with aiohttp.ClientSession() as session:
             async with session.post(endpoint, json=payload, headers=headers, ssl=False) as response:
                 if response.status == 200:
-                    data = await response.json()
-                    return data.get("choices", [{}])[0].get("message", {}).get("content", "No response")
-                error = f"Error: {response.status} - {await response.text()}"
-                if "error_log" in st.session_state:
-                    st.session_state.error_log.append(error)
-                logger.error(error)
-                return error
+                    async for line_bytes in response.content.readline():
+                        if not line_bytes:
+                            continue
+
+                        line_str = line_bytes.decode('utf-8').strip()
+
+                        if backend == "Ollama":
+                            if not line_str: continue
+                            try:
+                                chunk_json = json.loads(line_str)
+                                content = chunk_json.get("message", {}).get("content", "")
+                                if content:
+                                    yield content
+                                if chunk_json.get("done"):
+                                    break
+                            except json.JSONDecodeError:
+                                logger.warning(f"Ollama Stream: Could not decode JSON from line: {line_str}")
+                                continue
+                        else: # OpenAI / Hugging Face (SSE format)
+                            if line_str.startswith("data: "):
+                                data_part = line_str[len("data: "):].strip()
+                                if data_part == "[DONE]":
+                                    break
+                                if not data_part: # Handle empty data lines if they occur
+                                    continue
+                                try:
+                                    chunk_json = json.loads(data_part)
+                                    content = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                    if content:
+                                        yield content
+                                except json.JSONDecodeError:
+                                    logger.warning(f"SSE Stream: Could not decode JSON from data: {data_part}")
+                                    continue
+                else:
+                    error_text = await response.text()
+                    error = f"Error: {response.status} - {error_text}"
+                    if "error_log" in st.session_state: st.session_state.error_log.append(error)
+                    logger.error(error)
+                    yield f"Error generating response: Status {response.status}"
     except aiohttp.ClientError as e:
-        error = f"Error: {str(e)}"
-        if "error_log" in st.session_state:
-            st.session_state.error_log.append(error)
+        error = f"AIOHTTP ClientError: {str(e)}"
+        if "error_log" in st.session_state: st.session_state.error_log.append(error)
         logger.error(error)
-        return error
+        yield f"Network error during response generation: {str(e)}"
+    except Exception as e:
+        error_tb = traceback.format_exc()
+        error = f"Unhandled exception in generate_response: {str(e)}\n{error_tb}"
+        if "error_log" in st.session_state: st.session_state.error_log.append(error)
+        logger.error(error)
+        yield f"Server error during response generation: {str(e)}"
 
 def test_ui() -> Dict:
     """Self-test UI elements with detailed diagnostics."""
@@ -267,15 +312,23 @@ async def test_backend(backend: str, url: str) -> Dict:
         return {"status": "ERROR", "error": str(e)}
 
 async def test_model(backend: str, url: str, model: str, api_key: str = "") -> Dict:
-    """Test model health."""
+    """Test model health by consuming the async generator."""
+    response_content = []
     try:
-        response = await generate_response(backend, url, model, "Hello", [], api_key)
-        status = "SUCCESS" if "Error" not in response else "FAIL"
+        async for chunk in generate_response(backend, url, model, "Hello", [], api_key):
+            response_content.append(chunk)
+
+        full_response = "".join(response_content)
+        status = "SUCCESS" if "Error" not in full_response and full_response else "FAIL"
+        if not full_response and status == "SUCCESS": # It might be successful but empty if the test prompt is too short or filtered
+             status = "EMPTY_SUCCESS"
+
+
         logger.info(f"Model test for {model}: {status}")
-        return {"status": status, "response": response}
+        return {"status": status, "response": full_response if full_response else "No content received."}
     except Exception as e:
         logger.error(f"Model test failed: {str(e)}")
-        return {"status": "ERROR", "error": str(e)}
+        return {"status": "ERROR", "error": str(e), "response": "".join(response_content)}
 
 def run_prototype():
     """Run Streamlit GUI for Sophia prototype."""
@@ -286,42 +339,55 @@ def run_prototype():
         st.set_page_config(layout="wide", page_title="Sophia Prototype v12", page_icon=":sparkles:")
 
         # Theme CSS
-        theme_css = """
-        <style>
-            .main { display: flex; flex-direction: row; }
-            .chat-column { height: calc(100vh - 80px); overflow-y: auto; padding: 1rem; }
-            .chat-message { padding: 10px; margin-bottom: 10px; border-radius: 15px; max-width: 80%; }
-            .user-message { background-color: #e6e6e6; text-align: right; margin-left: auto; }
-            .bot-message { background-color: #0078d4; color: white; text-align: left; }
-            .typing-indicator { display: flex; justify-content: flex-start; }
-            .typing-indicator span { height: 10px; width: 10px; background-color: #0078d4; border-radius: 50%; margin-right: 5px; animation: wave 1s infinite ease-in-out; }
-            @keyframes wave { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-5px); } }
-            .chat-input { position: sticky; bottom: 0; background: white; z-index: 10; padding: 10px; }
-        </style>
-        """ if st.session_state.theme == "dark" else """
-        <style>
-            .main { display: flex; flex-direction: row; }
-            .chat-column { height: calc(100vh - 80px); overflow-y: auto; padding: 1rem; background: #f0f0f0; }
-            .chat-message { padding: 10px; margin-bottom: 10px; border-radius: 15px; max-width: 80%; }
-            .user-message { background-color: #d0d0d0; text-align: right; margin-left: auto; }
-            .bot-message { background-color: #00aaff; color: white; text-align: left; }
-            .typing-indicator { display: flex; justify-content: flex-start; }
-            .typing-indicator span { height: 10px; width: 10px; background-color: #00aaff; border-radius: 50%; margin-right: 5px; animation: wave 1s infinite ease-in-out; }
-            @keyframes wave { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-5px); } }
-            .chat-input { position: sticky; bottom: 0; background: #f0f0f0; z-index: 10; padding: 10px; }
-        </style>
-        """
+        if st.session_state.theme == "dark":
+            theme_css = """
+            <style>
+                .main { display: flex; flex-direction: row; }
+                .chat-column { height: calc(100vh - 160px); /* Adjusted for potentially taller input area */ overflow-y: auto; padding: 1rem; }
+                .chat-message { padding: 10px; margin-bottom: 10px; border-radius: 15px; max-width: 80%; }
+                .user-message { background-color: #4a4a4a; color: #FFFFFF; text-align: right; margin-left: auto; } /* Darker user message */
+                .bot-message { background-color: #0078d4; color: white; text-align: left; }
+                .typing-indicator { display: flex; justify-content: flex-start; }
+                .typing-indicator span { height: 10px; width: 10px; background-color: #0078d4; border-radius: 50%; margin-right: 5px; animation: wave 1s infinite ease-in-out; }
+                @keyframes wave { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-5px); } }
+                .chat-input { position: sticky; bottom: 0; background: #222222; z-index: 10; padding: 10px; border-top: 1px solid #444444; }
+                .stTextInput input[type="text"] {
+                    color: #FFFFFF !important; /* Light text */
+                    background-color: #333333 !important; /* Dark background for input field */
+                    border: 1px solid #555555 !important; /* Optional: Adjust border */
+                }
+            </style>
+            """
+        else: # Light theme
+            theme_css = """
+            <style>
+                .main { display: flex; flex-direction: row; }
+                .chat-column { height: calc(100vh - 160px); /* Adjusted for potentially taller input area */ overflow-y: auto; padding: 1rem; background: #f0f0f0; }
+                .chat-message { padding: 10px; margin-bottom: 10px; border-radius: 15px; max-width: 80%; }
+                .user-message { background-color: #d0d0d0; text-align: right; margin-left: auto; }
+                .bot-message { background-color: #00aaff; color: white; text-align: left; }
+                .typing-indicator { display: flex; justify-content: flex-start; }
+                .typing-indicator span { height: 10px; width: 10px; background-color: #00aaff; border-radius: 50%; margin-right: 5px; animation: wave 1s infinite ease-in-out; }
+                @keyframes wave { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-5px); } }
+                .chat-input { position: sticky; bottom: 0; background: #f0f0f0; z-index: 10; padding: 10px; border-top: 1px solid #cccccc; }
+                .stTextInput input[type="text"] {
+                    color: #000000 !important; /* Dark text */
+                    background-color: #FFFFFF !important; /* Light background for input field */
+                    border: 1px solid #CCCCCC !important; /* Optional: Adjust border */
+                }
+            </style>
+            """
         st.markdown(theme_css, unsafe_allow_html=True)
 
         # Sidebar for settings
         with st.sidebar:
             st.title("Sophia Prototype Settings")
             st.selectbox("Theme", options=["dark", "light"], key="theme")
-            if st.button("Toggle Settings"):
+            if st.button("Toggle Settings", key="toggle_settings_btn"):
                 st.session_state.settings_open = not st.session_state.settings_open
             if st.session_state.settings_open:
                 st.text_area("System Prompt", value=st.session_state.system_prompt, key="system_prompt_input")
-                if st.button("Save Prompt"):
+                if st.button("Save Prompt", key="save_prompt_btn"):
                     st.session_state.system_prompt = st.session_state.system_prompt_input
                     st.success("Prompt Saved!")
 
@@ -354,17 +420,20 @@ def run_prototype():
                 st.number_input("Context Length", 1000, max_tokens, min(max_tokens, 40000), key="context_length")
 
                 # Fetch models
-                if st.button("Detect Models"):
-                    if backend == "Ollama" and st.session_state.backend_url:
-                        st.session_state.available_models = get_ollama_models(st.session_state.backend_url)
-                    elif backend == "Hugging Face":
-                        st.session_state.available_models = BACKEND_CONFIG["Hugging Face"]["available_models"]
-                    elif backend == "LM Studio" and st.session_state.backend_url:
-                        st.session_state.available_models = ["llama-3-8b"]
-                    if st.session_state.available_models:
-                        st.success(f"Found {len(st.session_state.available_models)} models")
-                    else:
-                        st.error("No models found or invalid endpoint")
+                if st.button("Detect Models", key="detect_models_btn"):
+                    with st.spinner("Detecting models..."):
+                        if backend == "Ollama" and st.session_state.backend_url:
+                            st.session_state.available_models = get_ollama_models(st.session_state.backend_url)
+                        elif backend == "Hugging Face":
+                            st.session_state.available_models = BACKEND_CONFIG["Hugging Face"]["available_models"]
+                        elif backend == "LM Studio" and st.session_state.backend_url:
+                            # Assuming LM Studio might have a way to list models, for now, hardcoded or placeholder
+                            st.session_state.available_models = ["llama-3-8b"] # Example
+
+                        if st.session_state.available_models:
+                            st.success(f"Found {len(st.session_state.available_models)} models.")
+                        else:
+                            st.error("No models found or invalid endpoint for model detection.")
 
                 # Model selection
                 if st.session_state.available_models:
@@ -374,102 +443,173 @@ def run_prototype():
 
                 # Diagnostics
                 st.checkbox("Debug Mode", key="debug_mode")
-                if st.button("Run Self-Test"):
+                if st.button("Run Self-Test", key="run_self_test_btn"):
+                    # This is typically a very fast, UI-only test, spinner might be overkill,
+                    # but can be added for consistency if desired.
+                    # For now, leaving as is unless specified, as it's not async.
                     result = test_ui()
                     st.write(result)
-                if st.button("Test Backend"):
+                if st.button("Test Backend", key="test_backend_btn"):
                     if st.session_state.selected_backend and st.session_state.backend_url:
-                        result = asyncio.run(test_backend(st.session_state.selected_backend, st.session_state.backend_url))
-                        st.write(result)
-                if st.button("Test Model"):
+                        with st.spinner("Testing backend connection..."):
+                            result = asyncio.run(test_backend(st.session_state.selected_backend, st.session_state.backend_url))
+                            st.write(result)
+                    else:
+                        st.warning("Please select a backend and ensure URL is set.")
+                if st.button("Test Model", key="test_model_btn"):
                     if st.session_state.selected_backend and st.session_state.backend_url and st.session_state.selected_model:
-                        result = asyncio.run(test_model(
-                            st.session_state.selected_backend,
-                            st.session_state.backend_url,
-                            st.session_state.selected_model,
-                            st.session_state.api_key
-                        ))
-                        st.write(result)
+                        with st.spinner("Testing model..."):
+                            result = asyncio.run(test_model(
+                                st.session_state.selected_backend,
+                                st.session_state.backend_url,
+                                st.session_state.selected_model,
+                                st.session_state.api_key
+                            ))
+                            st.write(result)
+                    else:
+                        st.warning("Please select a backend, URL, and model first.")
 
-                if st.button("Clear History"):
+                if st.button("Clear History", key="clear_history_btn"):
                     st.session_state.messages = []
                     st.session_state.memory_db = []
                     st.session_state.input_submitted = False
                     st.session_state.last_input = None
+                    st.experimental_rerun() # Ensure UI refreshes
 
         # Main layout
         col1, col2 = st.columns([3, 1])
 
         with col1:
             st.markdown("<h1 style='text-align: center;'>Sophia Prototype v12</h1>", unsafe_allow_html=True)
-            chat_container = st.container()
 
-            # Display messages
-            with chat_container:
+            st.markdown('<div class="chat-column">', unsafe_allow_html=True)
+            # chat_container can be removed if not used elsewhere, or kept for logical grouping if preferred.
+            # For minimal structural change, we ensure message rendering happens within this div.
+            # Using a new container for messages to ensure it's inside chat-column div.
+            message_display_area = st.container()
+            with message_display_area:
                 for message in st.session_state.messages:
                     message_class = "user-message" if message["role"] == "user" else "bot-message"
                     st.markdown(f'<div class="chat-message {message_class}">{message["content"]}</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True) # End chat-column
 
-            # Export chat
+            # Export chat (can remain outside the chat-column, or inside if preferred, but logically separate)
             if st.session_state.messages:
-                json_data = json.dumps(st.session_state.messages, indent=2)
-                st.download_button("Export JSON", json_data, "chat_history.json")
-                markdown_data = "\n".join([f"**{m['role'].capitalize()}:** {m['content']}" for m in st.session_state.messages])
-                st.download_button("Export Markdown", markdown_data, "chat_history.md")
+                col_export1, col_export2 = st.columns(2)
+                with col_export1:
+                    json_data = json.dumps(st.session_state.messages, indent=2)
+                    st.download_button("Export JSON", json_data, "chat_history.json", key="export_json_btn")
+                with col_export2:
+                    markdown_data = "\n".join([f"**{m['role'].capitalize()}:** {m['content']}" for m in st.session_state.messages])
+                    st.download_button("Export Markdown", markdown_data, "chat_history.md", key="export_md_btn")
 
-            # User input with submit button
+            st.markdown('<div class="chat-input">', unsafe_allow_html=True)
             with st.form(key="chat_form"):
-                rune_suggestions = [r for r in RUNE_DICT.keys()]
+                # rune_suggestions = [r for r in RUNE_DICT.keys()] # This was unused, can be removed or used.
                 user_input = st.text_input("Enter rune string or query...", key="user_input", placeholder="e.g., ᚲᛚᛞ or 'What is the capital of France?'")
-                uploaded_image = st.file_uploader("Upload Image for MiniMax-VL-01", type=["png", "jpg", "jpeg"])
+                uploaded_image = st.file_uploader("Upload Image for MiniMax-VL-01", type=["png", "jpg", "jpeg"], key="img_upload")
                 submit_button = st.form_submit_button("Send")
 
                 if submit_button and user_input and user_input != st.session_state.last_input and st.session_state.selected_backend and st.session_state.selected_model:
                     st.session_state.input_submitted = True
-                    st.session_state.last_input = user_input
-                    st.session_state.messages.append({"role": "user", "content": user_input})
-                    context = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[-5:]]
+                    st.session_state.last_input = user_input # Track last input to prevent re-submission
+                    st.session_state.messages.append({"role": "user", "content": user_input}) # Add user message to chat
+                    current_context = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[-6:-1]] # Get recent context, excluding current user message for now
+                    processed_context = current_context # Initialize with text context
                     if uploaded_image:
                         image = Image.open(uploaded_image)
-                        image.thumbnail((2016, 2016))
+                        # Optionally resize or process image if needed for the model
+                        # For example, if MiniMax-VL-01 has specific size limits.
+                        # image.thumbnail((1024, 1024)) # Example resize
                         buffered = io.BytesIO()
-                        image.save(buffered, format="PNG")
-                        context.append({"role": "user", "content": "Image uploaded", "image": buffered.getvalue()})
+                        image.save(buffered, format="PNG") # Or JPEG, depending on model preference
+                        # How image context is added depends on the model's expected format.
+                        # This example assumes adding it as a special item in the context list.
+                        # Adapt if model expects image in a different part of the payload.
+                        processed_context.append({"role": "user", "content": "Image uploaded", "image_data": buffered.getvalue()})
+
 
                     # Archive to memory_db
                     st.session_state.memory_db.append({
                         'timestamp': datetime.now().isoformat(),
                         'input': user_input,
-                        'context': context
+                        'context': processed_context # Save the context used for generation
                     })
 
                     # Process input
                     if any(rune in user_input for rune in RUNE_DICT):
                         result = parse_gl(user_input)
-                        response = json.dumps(result, indent=2)
+                        response_content = json.dumps(result, indent=2)
+                        st.session_state.messages.append({"role": "assistant", "content": response_content})
+                        if st.session_state.memory_db: st.session_state.memory_db[-1]['output'] = response_content
+                        st.session_state.input_submitted = False
+                        st.experimental_rerun()
                     else:
-                        response = asyncio.run(generate_response(
+                        st.session_state.messages.append({"role": "assistant", "content": ""}) # Placeholder for streaming
+                        st.experimental_rerun()
+
+            st.markdown('</div>', unsafe_allow_html=True) # End chat-input
+
+            # Streaming logic (needs to be outside the form, but within col1)
+            if st.session_state.messages and \
+               st.session_state.messages[-1]["role"] == "assistant" and \
+               st.session_state.messages[-1]["content"] == "" and \
+               st.session_state.input_submitted: # Ensure this only runs for active submissions requiring LLM response
+
+                # Retrieve the context that was archived. This is important if images are involved.
+                # The last_input is the prompt. The context is everything before it.
+                archived_context = []
+                if st.session_state.memory_db:
+                    archived_context = st.session_state.memory_db[-1].get('context', [])
+
+                # Ensure context for LLM does not include the last (empty) assistant message itself
+                # And should be based on the actual context used, which is now in memory_db
+                context_for_llm = archived_context # Use the context from memory_db
+
+                full_response_content = ""
+                # The spinner should ideally be part of the chat-column or managed carefully with reruns
+                # For now, placing it before starting the async task.
+                # Consider how this interacts with st.experimental_rerun() inside the stream.
+                # A placeholder in the chat might be better: e.g., messages[-1]["content"] = "Thinking..."
+                with st.spinner("Sophia is thinking..."):
+                    async def stream_llm_response():
+                        nonlocal full_response_content
+                        async for chunk in generate_response(
                             backend=st.session_state.selected_backend,
                             url=st.session_state.backend_url,
                             model=st.session_state.selected_model,
-                            prompt=user_input,
-                            context=context,
+                            prompt=st.session_state.last_input,
+                            context=context_for_llm,
                             api_key=st.session_state.api_key
-                        ))
+                        ):
+                            full_response_content += chunk
+                            st.session_state.messages[-1]["content"] = full_response_content
+                            st.experimental_rerun()
 
-                    st.session_state.messages.append({"role": "assistant", "content": response})
-                    st.session_state.memory_db[-1]['output'] = response
-                    st.session_state.input_submitted = False
+                    asyncio.run(stream_llm_response())
+
+                # Final update after stream, though reruns handle intermediate updates
+                st.session_state.messages[-1]["content"] = full_response_content
+                if st.session_state.memory_db:
+                     st.session_state.memory_db[-1]['output'] = full_response_content
+                st.session_state.input_submitted = False # Reset flag
+                # A final rerun might be needed if the stream was empty or very fast.
+                # However, if every chunk causes a rerun, this might be redundant. Test carefully.
+                st.experimental_rerun()
 
         with col2:
             st.write("Simulation Visuals")
-            g_EM = st.slider("g_EM", 0.0, 2.0, 1.0)
-            coherence = st.slider("Coherence", 0.0, 1.0, 0.9)
+            g_EM = st.slider("g_EM", 0.0, 2.0, 1.0, key="g_em_slider")
+            coherence = st.slider("Coherence", 0.0, 1.0, 0.9, key="coherence_slider")
             if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
                 try:
-                    result = json.loads(st.session_state.messages[-1]["content"])
-                    if result.get('status') == 'SUCCESS':
-                        st.line_chart(result['simulation']['phi_field'])
+                    # Attempt to parse content as JSON (for GL/RUFT simulation results)
+                    # Suppress errors if it's plain text from LLM
+                    content_to_parse = st.session_state.messages[-1]["content"]
+                    if isinstance(content_to_parse, str) and content_to_parse.strip().startswith("{"):
+                        result = json.loads(content_to_parse)
+                        if result.get('status') == 'SUCCESS' and 'simulation' in result and 'phi_field' in result['simulation']:
+                            st.line_chart(result['simulation']['phi_field'])
                 except json.JSONDecodeError:
                     pass
 
@@ -480,7 +620,7 @@ def run_prototype():
                         st.write(error)
 
     except Exception as e:
-        error_msg = f"Application error: {str(e)}\n{traceback.format_exc()}"
+        error_msg = f"Application error: {str(e)}\n{traceback.format_exc()}" # Escaped newline for string
         logger.error(error_msg)
         if "error_log" not in st.session_state:
             st.session_state.error_log = []
