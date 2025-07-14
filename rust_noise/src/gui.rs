@@ -1,16 +1,10 @@
 use crate::noise::{Noise, NoiseType};
 use eframe::{egui, epi};
 use image::{ImageBuffer, Rgba};
-use noise::{
-    self,
-    NoiseFn,
-    Point2,
-};
 
 pub struct NoiseGui {
     noise: Noise,
     texture: Option<egui::TextureHandle>,
-    seed: u32,
 }
 
 impl Default for NoiseGui {
@@ -18,7 +12,6 @@ impl Default for NoiseGui {
         Self {
             noise: Noise::default(),
             texture: None,
-            seed: 0,
         }
     }
 }
@@ -37,7 +30,7 @@ impl epi::App for NoiseGui {
         self.generate_texture(ctx);
     }
 
-    fn update(&mut self, ctx: &egui::CtxRef, frame: &mut epi::Frame<'_>) {
+    fn update(&mut self, ctx: &egui::CtxRef, _frame: &mut epi::Frame<'_>) {
         let needs_new_texture = egui::CentralPanel::default()
             .show(ctx, |ui| {
                 ui.heading("Noise Parameters");
@@ -58,9 +51,6 @@ impl epi::App for NoiseGui {
                     .changed();
                 changed |= ui
                     .add(egui::Slider::new(&mut self.noise.gain, 0.0..=1.0).text("Gain"))
-                    .changed();
-                changed |= ui
-                    .add(egui::Slider::new(&mut self.seed, 0..=1000).text("Seed"))
                     .changed();
 
                 egui::ComboBox::from_label("Noise Type")
@@ -121,16 +111,15 @@ impl NoiseGui {
     }
 
     fn get_noise(&self, x: f64, y: f64) -> f64 {
-        let point = [x, y];
         let mut value = 0.0;
         let mut frequency = self.noise.frequency;
         let mut amplitude = self.noise.gain;
 
         for _ in 0..self.noise.octaves {
             let sample = match self.noise.noise_type {
-                NoiseType::Value => noise::Value::new(self.seed).get([point[0] * frequency, point[1] * frequency]),
-                NoiseType::Perlin => noise::Perlin::new(self.seed).get([point[0] * frequency, point[1] * frequency]),
-                NoiseType::Simplex => noise::Simplex::new(self.seed).get([point[0] * frequency, point[1] * frequency]),
+                NoiseType::Value => self.noise.value(x * frequency, y * frequency),
+                NoiseType::Perlin => self.noise.perlin(x * frequency, y * frequency),
+                NoiseType::Simplex => self.noise.simplex(x * frequency, y * frequency),
             };
             value += sample * amplitude;
             frequency *= self.noise.lacunarity;
